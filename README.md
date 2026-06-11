@@ -24,7 +24,7 @@ I gutted the original firmware updater, web UI, and JSON outputs to build a zero
 Requires Go 1.21 or later:
 
 ```bash
-git clone [https://github.com/YOUR-USERNAME/tc66c-toolkit](https://github.com/YOUR-USERNAME/tc66c-toolkit)
+https://github.com/fabcj/tc66c-csv-logger.git
 cd tc66c-toolkit
 go build -o tc66c-toolkit .
 ```
