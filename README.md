@@ -1,166 +1,82 @@
-# TC66C Toolkit
+# TC66C Toolkit (CSV Logging Fork)
 
-A command-line toolkit for interacting with TC66/TC66C USB power meters. Read measurements, poll data continuously, retrieve recordings, and update firmware.
+A command-line toolkit for interacting with TC66/TC66C USB power meters. This fork has been heavily stripped down and optimized specifically for high-speed, automated CSV data logging.
 
 ## Disclaimer
 
-**This project has been 99.99% vivecoded and was not reviewed at all.** It can and will contain bugs, and the UX might not be the best one. Use at your own risk.
+**This fork was heavily overhauled for a specific research use-case.** It can and will contain bugs, and the UX is highly specialized. Use at your own risk.
 
-The firmware update feature has been tested by myself on two devices, updating from versions 1.09 and 1.12 to 1.18, and also flashing 1.18 over a corrupted device (yes, the firmware update code didn't work on the first try) returning it to life, so it should be pretty safe to use.
+I gutted the original firmware updater, web UI, and JSON outputs to build a zero-allocation, ultra-fast CSV pipeline. Since it no longer updates firmware, it shouldn't be able to brick your device during high-frequency polling, but again—it's offered as-is.
 
 ## Features
 
-- **Get readings**: Single snapshot of voltage, current, power, and more
+- **High-speed CSV logging**: Zero-allocation pipeline perfect for piping into Pandas, Grafana, or benchmark scripts
 - **Continuous polling**: Monitor readings in real-time at configurable intervals
-- **Web UI**: Browser-based interface with real-time graphing and monitoring
-- **Recording retrieval**: Download stored measurement data from the device
-- **Firmware updates**: Flash new firmware to your device (bootloader mode)
-- **JSON output**: Export data in JSON format for scripting and analysis
+- **Auto-detection**: Automatically finds the meter on available serial ports
+- **Interactive & Scriptable**: Prompts for a filename, or accepts piped input for fully headless bash scripting
+- **Safe shutdown**: Catches `Ctrl+C` or `SIGTERM` to gracefully flush buffers and close the CSV
 - **Cross-platform**: Works on Linux, macOS, and Windows
 
 ## Installation
 
 ### From Source
 
-Requires Go 1.25 or later:
+Requires Go 1.21 or later:
 
 ```bash
-git clone https://github.com/skgsergio/tc66c-toolkit
+git clone [https://github.com/YOUR-USERNAME/tc66c-toolkit](https://github.com/YOUR-USERNAME/tc66c-toolkit)
 cd tc66c-toolkit
-go build -o tc66c-toolkit ./cmd/toolkit
+go build -o tc66c-toolkit .
 ```
 
 ## Usage
 
 ### Basic Commands
+This fork compiles into a single, specialized command. There are no subcommands like get or poll anymore.
 
-#### Get a Single Reading
+###Interactive Mode
 
-```bash
-# Basic reading
-tc66c-toolkit get
-
-# JSON output
-tc66c-toolkit get --json
-
-# Custom serial port
-tc66c-toolkit get -p /dev/ttyUSB0
-```
-
-#### Continuous Polling
+Run the binary. It will auto-detect the meter and prompt you for a save location:
 
 ```bash
-# Poll every 500ms (default)
-tc66c-toolkit poll
+./tc66c-toolkit
+```
+### Automated Scripting Mode
+You can pipe the filename directly into the program and specify polling flags. This completely bypasses the interactive prompt, making it perfect for automated benchmark scripts:
+``` bash
+# Poll every 100ms and save to benchmark.csv
+echo "benchmark.csv" | ./tc66c-toolkit -interval 100ms
 
-# Poll every second
-tc66c-toolkit poll -i 1s
-
-# Poll with JSON output
-tc66c-toolkit poll --json
+# Specify an exact port
+echo "data.csv" | ./tc66c-toolkit -port /dev/ttyUSB0 -interval 500ms
 ```
 
-#### Web UI
+### Flags
+-port: Serial port device path (leave blank to auto-detect)
 
-Start a web server with a browser-based interface for real-time monitoring:
+-interval: Sampling polling interval (default: 250ms)
 
-```bash
-# Start web server (default: localhost:8080)
-tc66c-toolkit web
-
-# Custom address and port
-tc66c-toolkit web -a 0.0.0.0 -w 8080
-```
-
-Then open your browser to `http://localhost:8080`. The Web UI provides:
-
-- **Serial port detection**: Automatically lists available serial ports
-- **Real-time graphing**: Dual Y-axis charts with configurable metrics
-- **Live readings**: Display of voltage, current, power, temperature, and more
-- **Configurable polling**: Adjustable intervals from 100ms to 2s
-- **WebSocket updates**: Efficient real-time data streaming
-
-#### Retrieve Recordings
-
-```bash
-tc66c-toolkit recording
-```
-
-#### Update Firmware
-
-**Warning**: Only use firmware files from trusted sources.
-
-```bash
-# Enter bootloader mode first:
-# 1. Unplug the device
-# 2. Press and hold K1 button
-# 3. Plug in the device while holding K1
-# 4. Release K1
-
-tc66c-toolkit update -f firmware.bin
-```
-
-### Global Flags
-
-- `-p, --port`: Serial port device path (default: `/dev/ttyACM0`)
-- `-h, --help`: Show help
-
-### Command-Specific Flags
-
-**poll**:
-- `-i, --interval`: Polling interval (default: `500ms`)
-- `-j, --json`: Output in JSON format
-
-**get**:
-- `-j, --json`: Output in JSON format
-
-**web**:
-- `-a, --address`: Address to bind the web server (default: `localhost`)
-- `-w, --web-port`: Port for the web server (default: `8080`)
-
-**update**:
-- `-f, --file`: Firmware file (required)
-
-## Output Formats
-
-### Text Format (Default)
+### Output Formats
+CSV Format
+Data is written natively to CSV format for maximum performance:
 
 ```
-Product: TC66
-Version: 1.14
-Serial: 12345678
-Runs: 42
-Voltage: 5.1234 V
-Current: 0.51234 A
-Power: 2.6234 W
-Resistance: 10.00 Ω
-Group 0: 1234 mAh / 5678 mWh
-Group 1: 2345 mAh / 6789 mWh
-Temperature: 25.0 °C
-D+ Voltage: 2.75 V
-D- Voltage: 2.75 V
+timestamp,voltage_v,current_a,power_w,resistance_ohm,capacity_mah,energy_mwh,dplus_v,dminus_v,temperature_c
+2026-06-11 16:05:35.123,5.1234,0.51234,2.6234,10.00,1234,5678,2.75,2.75,25.0
+2026-06-11 16:05:35.223,5.1230,0.51240,2.6250,10.01,1234,5678,2.75,2.75,25.0
 ```
-
-### JSON Format
-
-```json
-{"product":"TC66","version":"1.14","serial_number":12345678,"num_runs":42,"voltage":5.1234,"current":0.51234,"power":2.6234,"resistance":10.00,"group0_mah":1234,"group0_mwh":5678,"group1_mah":2345,"group1_mwh":6789,"temperature_sign":0,"temperature":25.0,"dplus_voltage":2.75,"dminus_voltage":2.75}
-```
-
-## Library Usage
-
+### Library Usage
 The toolkit can also be used as a Go library:
-
 ```go
 package main
 
 import (
     "fmt"
-    "github.com/skgsergio/tc66c-toolkit/lib/tc66c"
+    "[github.com/YOUR-USERNAME/tc66c-toolkit/internal/protocol](https://github.com/YOUR-USERNAME/tc66c-toolkit/internal/protocol)"
 )
 
 func main() {
-    device, err := tc66c.NewTC66C("/dev/ttyACM0")
+    device, err := protocol.NewTC66C("/dev/ttyACM0")
     if err != nil {
         panic(err)
     }
@@ -176,26 +92,21 @@ func main() {
     fmt.Printf("Power: %.4f W\n", reading.Power)
 }
 ```
-
 ## Troubleshooting
+Permission Denied on Linux
+Add your user to the dialout group:
 
-### Permission Denied on Linux
-
-Add your user to the `dialout` group:
-
-```bash
+```Bash
 sudo usermod -a -G dialout $USER
 ```
-
 Then log out and back in.
 
-Alternatively, run with `sudo` (not recommended for regular use).
+Alternatively, run with sudo (not recommended for regular use).
 
 ### Device Not Found
-
 Check which port your device is on:
 
-```bash
+```Bash
 # Linux
 ls /dev/ttyACM* /dev/ttyUSB*
 
@@ -205,26 +116,24 @@ ls /dev/cu.usbmodem*
 # Windows
 # Check Device Manager for COM ports
 ```
-
 Then specify the port:
-
-```bash
-tc66c-toolkit get -p /dev/ttyUSB0  # or COM3 on Windows
+```Bash
+./tc66c-toolkit -port /dev/ttyUSB0  # or COM3 on Windows
 ```
-
 ## Protocol
+The communication protocol is based on the sigrok project's TC66C protocol documentation. The device uses:
 
-The communication protocol is based on the [sigrok project's TC66C protocol documentation](https://sigrok.org/wiki/RDTech_TC66C). The device uses:
+Baud rate: 115200
 
-- **Baud rate**: 115200
-- **Data bits**: 8
-- **Parity**: None
-- **Stop bits**: 1
+Data bits: 8
+
+Parity: None
+
+Stop bits: 1
 
 All measurement data is AES-ECB encrypted with a static key.
 
 ## License
+Licensed under The "Better Ask The LLM" License (BATL) - Software offered "as is, maybe" with no warranties or guarantees. Use at your own risk, and when in doubt, better ask the LLM!
 
-Licensed under **The "Better Ask The LLM" License (BATL)** - Software offered "as is, maybe" with no warranties or guarantees. Use at your own risk, and when in doubt, better ask the LLM!
-
-See [LICENSE.md](LICENSE.md) for details.
+See LICENSE.md for details.
