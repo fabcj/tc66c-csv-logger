@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/skgsergio/tc66-toolkit/internal/cpu"
 	"github.com/skgsergio/tc66-toolkit/internal/protocol"
 )
 
@@ -21,6 +22,13 @@ func startCSVLogging(port string, filename string, interval time.Duration) {
 	}
 	defer tc.Close()
 
+	cpuMon := cpu.NewMonitor()
+	cpuEnabled := true
+	if err := cpuMon.Prime(); err != nil {
+		fmt.Printf("[CPU Monitor] Disabled, couldn't read sysfs: %v\n", err)
+		cpuEnabled = false
+	}
+
 	cw, err := NewCSVWriter(filename)
 	if err != nil {
 		fmt.Printf("Failed to create CSV: %v\n", err)
@@ -30,6 +38,9 @@ func startCSVLogging(port string, filename string, interval time.Duration) {
 
 	fmt.Printf("\n▶ RECORDING STARTED\n")
 	fmt.Printf("Saving data to '%s' every %v.\n", filename, interval)
+	if cpuEnabled {
+		fmt.Printf("CPU telemetry (temp/usage/freq) is being logged alongside each sample.\n")
+	}
 	fmt.Printf("Press Ctrl+C to safely stop and save the file.\n\n")
 
 	sigChan := make(chan os.Signal, 1)
@@ -53,7 +64,16 @@ func startCSVLogging(port string, filename string, interval time.Duration) {
 				continue
 			}
 
-			if err := cw.WriteLog(reading); err != nil {
+			var cpuReading *cpu.Reading
+			if cpuEnabled {
+				cpuReading, err = cpuMon.Sample()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[CPU Monitor] Failed reading stats: %v\n", err)
+					cpuReading = nil
+				}
+			}
+
+			if err := cw.WriteLog(reading, cpuReading); err != nil {
 				fmt.Fprintf(os.Stderr, "[Write Error] Failed writing to file: %v\n", err)
 				return
 			}
@@ -84,6 +104,10 @@ func NewCSVWriter(filename string) (*CSVWriter, error) {
 		file.Close()
 		return nil, err
 	}
+	if _, err := writer.WriteString(",cpu_temp_c,cpu_usage_pct,cpu_freq_mhz"); err != nil {
+		file.Close()
+		return nil, err
+	}
 	if err := writer.WriteByte('\n'); err != nil {
 		file.Close()
 		return nil, err
@@ -92,11 +116,11 @@ func NewCSVWriter(filename string) (*CSVWriter, error) {
 	return &CSVWriter{
 		file:    file,
 		writer:  writer,
-		scratch: make([]byte, 0, 128),
+		scratch: make([]byte, 0, 160),
 	}, nil
 }
 
-func (cw *CSVWriter) WriteLog(r *protocol.Reading) error {
+func (cw *CSVWriter) WriteLog(r *protocol.Reading, cpu *cpu.Reading) error {
 	now := time.Now()
 	cw.scratch = cw.scratch[:0]
 
@@ -136,8 +160,24 @@ func (cw *CSVWriter) WriteLog(r *protocol.Reading) error {
 	cw.scratch = strconv.AppendFloat(cw.scratch, r.DMinus, 'f', 2, 64)
 	cw.scratch = append(cw.scratch, ',')
 
-	// Temperature (C)
+	// Temperature (C, meter's internal sensor)
 	cw.scratch = strconv.AppendFloat(cw.scratch, r.Temperature, 'f', 1, 64)
+	cw.scratch = append(cw.scratch, ',')
+
+	if cpu != nil {
+		// CPU Temperature (C)
+		cw.scratch = strconv.AppendFloat(cw.scratch, cpu.TemperatureC, 'f', 1, 64)
+		cw.scratch = append(cw.scratch, ',')
+
+		// CPU Usage (%)
+		cw.scratch = strconv.AppendFloat(cw.scratch, cpu.UsagePercent, 'f', 1, 64)
+		cw.scratch = append(cw.scratch, ',')
+
+		// CPU Frequency (MHz)
+		cw.scratch = strconv.AppendFloat(cw.scratch, cpu.FreqMHz, 'f', 0, 64)
+	} else {
+		cw.scratch = append(cw.scratch, ',', ',')
+	}
 	cw.scratch = append(cw.scratch, '\n')
 
 	_, err := cw.writer.Write(cw.scratch)
