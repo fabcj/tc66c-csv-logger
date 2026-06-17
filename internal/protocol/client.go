@@ -144,15 +144,17 @@ func ParseZeroAlloc(data []byte, r *Reading) error {
 	r.Voltage = float64(binary.LittleEndian.Uint32(pac1[48:52])) * 1e-4
 	r.Current = float64(binary.LittleEndian.Uint32(pac1[52:56])) * 1e-5
 	r.Power = float64(binary.LittleEndian.Uint32(pac1[56:60])) * 1e-4
-	
-	// Accumulators
-	r.CapacitymAh = binary.LittleEndian.Uint32(pac1[32:36])
-	r.EnergymWh = binary.LittleEndian.Uint32(pac1[36:40])
 
-	// Sub-metrics
-	r.Resistance = float64(binary.LittleEndian.Uint32(pac2[4:8])) * 1e-2
-	r.DPlus = float64(binary.LittleEndian.Uint16(pac2[16:18])) * 1e-2
-	r.DMinus = float64(binary.LittleEndian.Uint16(pac2[18:20])) * 1e-2
+	// Sub-metrics (all in pac2, not pac1 - resistance is in units of 0.1 Ohm)
+	r.Resistance = float64(binary.LittleEndian.Uint32(pac2[4:8])) * 1e-1
+
+	// Accumulators - "Group 0" counters, located in pac2 (not pac1)
+	r.CapacitymAh = binary.LittleEndian.Uint32(pac2[8:12])
+	r.EnergymWh = binary.LittleEndian.Uint32(pac2[12:16])
+
+	// D+/D- line voltage are full 32-bit fields, not 16-bit, at offset 32/36
+	r.DPlus = float64(binary.LittleEndian.Uint32(pac2[32:36])) * 1e-2
+	r.DMinus = float64(binary.LittleEndian.Uint32(pac2[36:40])) * 1e-2
 
 	tempRaw := binary.LittleEndian.Uint32(pac2[28:32])
 	if binary.LittleEndian.Uint32(pac2[24:28]) != 0 {
