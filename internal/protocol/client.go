@@ -53,9 +53,10 @@ func NewTC66C(portName string) (*TC66C, error) {
 	if err := tc.WriteCommand([]byte(CmdQuery)); err == nil {
 		response := make([]byte, 4)
 		if err := tc.ReadFull(response); err == nil {
-			if string(response) == "firm" {
+			switch string(response) {
+			case "firm":
 				tc.Mode = ModeFirmware
-			} else if string(response) == "boot" {
+			case "boot":
 				tc.Mode = ModeBootloader
 			}
 		}
@@ -140,19 +141,15 @@ func ParseZeroAlloc(data []byte, r *Reading) error {
 		return fmt.Errorf("checksum failed")
 	}
 
-	// Physics Metrics
 	r.Voltage = float64(binary.LittleEndian.Uint32(pac1[48:52])) * 1e-4
 	r.Current = float64(binary.LittleEndian.Uint32(pac1[52:56])) * 1e-5
 	r.Power = float64(binary.LittleEndian.Uint32(pac1[56:60])) * 1e-4
 
-	// Sub-metrics (all in pac2, not pac1 - resistance is in units of 0.1 Ohm)
 	r.Resistance = float64(binary.LittleEndian.Uint32(pac2[4:8])) * 1e-1
 
-	// Accumulators - "Group 0" counters, located in pac2 (not pac1)
 	r.CapacitymAh = binary.LittleEndian.Uint32(pac2[8:12])
 	r.EnergymWh = binary.LittleEndian.Uint32(pac2[12:16])
 
-	// D+/D- line voltage are full 32-bit fields, not 16-bit, at offset 32/36
 	r.DPlus = float64(binary.LittleEndian.Uint32(pac2[32:36])) * 1e-2
 	r.DMinus = float64(binary.LittleEndian.Uint32(pac2[36:40])) * 1e-2
 

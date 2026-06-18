@@ -13,8 +13,8 @@ import (
 	"github.com/skgsergio/tc66-toolkit/internal/protocol"
 )
 
-func startCSVLogging(port string, filename string, interval time.Duration) {
-	fmt.Printf("Connecting to meter...\n")
+func startCSVLogging(port string, filename string, interval time.Duration, targetPID int, serviceName string) {
+	fmt.Printf("[PORT Monitor]: Connecting to monitor\n")
 	tc, err := protocol.NewTC66C(port)
 	if err != nil {
 		fmt.Printf("Connection failed: %v\n", err)
@@ -22,12 +22,13 @@ func startCSVLogging(port string, filename string, interval time.Duration) {
 	}
 	defer tc.Close()
 
-	cpuMon := cpu.NewMonitor()
+	cpuMon := cpu.NewMonitor(targetPID, serviceName)
 	cpuEnabled := true
 	if err := cpuMon.Prime(); err != nil {
-		fmt.Printf("[CPU Monitor] Disabled, couldn't read sysfs: %v\n", err)
+		fmt.Printf("[CPU Monitor] PMU initialization skipped: %v\n", err)
 		cpuEnabled = false
 	}
+	defer cpuMon.Close()
 
 	cw, err := NewCSVWriter(filename)
 	if err != nil {
@@ -100,15 +101,8 @@ func NewCSVWriter(filename string) (*CSVWriter, error) {
 
 	writer := bufio.NewWriterSize(file, 64*1024)
 
-	if _, err := writer.WriteString(protocol.CSVHeader()); err != nil {
-		file.Close()
-		return nil, err
-	}
-	if _, err := writer.WriteString(",cpu_temp_c,cpu_usage_pct,cpu_freq_mhz"); err != nil {
-		file.Close()
-		return nil, err
-	}
-	if err := writer.WriteByte('\n'); err != nil {
+	header := protocol.CSVHeader() + ",cpu_temp_c,cpu_usage_pct,cpu_freq_mhz,cpu_total_cycles,cpu_target_cycles,attributed_watts\n"
+	if _, err := writer.WriteString(header); err != nil {
 		file.Close()
 		return nil, err
 	}
@@ -120,66 +114,54 @@ func NewCSVWriter(filename string) (*CSVWriter, error) {
 	}, nil
 }
 
-func (cw *CSVWriter) WriteLog(r *protocol.Reading, cpu *cpu.Reading) error {
+func (cw *CSVWriter) WriteLog(r *protocol.Reading, cpuR *cpu.Reading) error {
 	now := time.Now()
 	cw.scratch = cw.scratch[:0]
 
-	// Timestamp
 	cw.scratch = now.AppendFormat(cw.scratch, "2006-01-02 15:04:05.000")
 	cw.scratch = append(cw.scratch, ',')
-
-	// Voltage (V)
 	cw.scratch = strconv.AppendFloat(cw.scratch, r.Voltage, 'f', 4, 64)
 	cw.scratch = append(cw.scratch, ',')
-
-	// Current (A)
 	cw.scratch = strconv.AppendFloat(cw.scratch, r.Current, 'f', 5, 64)
 	cw.scratch = append(cw.scratch, ',')
-
-	// Power (W)
 	cw.scratch = strconv.AppendFloat(cw.scratch, r.Power, 'f', 4, 64)
 	cw.scratch = append(cw.scratch, ',')
-
-	// Resistance (Ohms)
 	cw.scratch = strconv.AppendFloat(cw.scratch, r.Resistance, 'f', 2, 64)
 	cw.scratch = append(cw.scratch, ',')
-
-	// Capacity (mAh)
 	cw.scratch = strconv.AppendUint(cw.scratch, uint64(r.CapacitymAh), 10)
 	cw.scratch = append(cw.scratch, ',')
-
-	// Energy (mWh)
 	cw.scratch = strconv.AppendUint(cw.scratch, uint64(r.EnergymWh), 10)
 	cw.scratch = append(cw.scratch, ',')
-
-	// D+ Line Voltage
 	cw.scratch = strconv.AppendFloat(cw.scratch, r.DPlus, 'f', 2, 64)
 	cw.scratch = append(cw.scratch, ',')
-
-	// D- Line Voltage
 	cw.scratch = strconv.AppendFloat(cw.scratch, r.DMinus, 'f', 2, 64)
 	cw.scratch = append(cw.scratch, ',')
-
-	// Temperature (C, meter's internal sensor)
 	cw.scratch = strconv.AppendFloat(cw.scratch, r.Temperature, 'f', 1, 64)
 	cw.scratch = append(cw.scratch, ',')
 
-	if cpu != nil {
-		// CPU Temperature (C)
-		cw.scratch = strconv.AppendFloat(cw.scratch, cpu.TemperatureC, 'f', 1, 64)
-		cw.scratch = append(cw.scratch, ',')
+	if cpuR != nil {
+		const pi4IdleBaseline = 2.50
+		attributedWatts := 0.0
+		if r.Power > pi4IdleBaseline && cpuR.TotalCycles > 0 {
+			attributedWatts = (r.Power - pi4IdleBaseline) * (float64(cpuR.TargetCycles) / float64(cpuR.TotalCycles))
+		}
 
-		// CPU Usage (%)
-		cw.scratch = strconv.AppendFloat(cw.scratch, cpu.UsagePercent, 'f', 1, 64)
+		cw.scratch = strconv.AppendFloat(cw.scratch, cpuR.TemperatureC, 'f', 1, 64)
 		cw.scratch = append(cw.scratch, ',')
-
-		// CPU Frequency (MHz)
-		cw.scratch = strconv.AppendFloat(cw.scratch, cpu.FreqMHz, 'f', 0, 64)
+		cw.scratch = strconv.AppendFloat(cw.scratch, cpuR.UsagePercent, 'f', 1, 64)
+		cw.scratch = append(cw.scratch, ',')
+		cw.scratch = strconv.AppendFloat(cw.scratch, cpuR.FreqMHz, 'f', 0, 64)
+		cw.scratch = append(cw.scratch, ',')
+		cw.scratch = strconv.AppendUint(cw.scratch, cpuR.TotalCycles, 10)
+		cw.scratch = append(cw.scratch, ',')
+		cw.scratch = strconv.AppendUint(cw.scratch, cpuR.TargetCycles, 10)
+		cw.scratch = append(cw.scratch, ',')
+		cw.scratch = strconv.AppendFloat(cw.scratch, attributedWatts, 'f', 4, 64)
 	} else {
-		cw.scratch = append(cw.scratch, ',', ',')
+		cw.scratch = append(cw.scratch, ",,,,,0"...)
 	}
-	cw.scratch = append(cw.scratch, '\n')
 
+	cw.scratch = append(cw.scratch, '\n')
 	_, err := cw.writer.Write(cw.scratch)
 	return err
 }
