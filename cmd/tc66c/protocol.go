@@ -1,4 +1,4 @@
-package protocol
+package main
 
 import (
 	"encoding/binary"
@@ -8,56 +8,76 @@ import (
 	"go.bug.st/serial"
 )
 
-const (
-	BlockSize  = 64
-	NumBlocks  = 3
-	PacketSize = BlockSize * NumBlocks
-
-	CmdQuery = "query\r\n"
-	CmdGetVA = "getva\r\n"
-)
-
 type DeviceMode int
 
+type TC66C struct {
+	port 	serial.Port
+	Mode 	DeviceMode
+}
+
+type powerReading struct {
+	Voltage     	float64
+	Current     	float64
+	Power       	float64
+	Resistance  	float64
+	CapacitymAh 	uint32
+	EnergymWh   	uint32
+	DPlus       	float64
+	DMinus      	float64
+	Temperature 	float64
+}
+
 const (
-	ModeFirmware DeviceMode = iota
-	ModeBootloader
-	ModeUnknown
+	BLOCK_SIZE  = 64
+	NUM_BLOCKS  = 3
+	PACKET_SIZE = BLOCK_SIZE * NUM_BLOCKS
+
+	CMD_QUERY  = "query\r\n"
+	CMD_GET_VA = "getva\r\n"
 )
 
-type TC66C struct {
-	port serial.Port
-	Mode DeviceMode
-}
+const (
+	MODE_FIRMWARE DeviceMode = iota
+	MODE_BOOTLOADER
+	MODE_UNKOWN
+)
+
 
 func NewTC66C(portName string) (*TC66C, error) {
 	mode := &serial.Mode{
 		BaudRate: 115200,
-		DataBits: 8,
 		Parity:   serial.NoParity,
+		DataBits: 8,
 		StopBits: serial.OneStopBit,
 	}
 
+	// Open port
 	port, err := serial.Open(portName, mode)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open port: %w", err)
+		return nil, fmt.Errorf("[ERR]: Failed to open port %w", err)
 	}
 
+	// Verify SetReadTimeout
 	if err := port.SetReadTimeout(2 * time.Second); err != nil {
 		port.Close()
-		return nil, fmt.Errorf("failed to set timeout: %w", err)
+		return nil, fmt.Errorf("[ERR]: Failed to set timeout: %w", err)
 	}
 
-	tc := &TC66C{port: port, Mode: ModeUnknown}
+	tc := &TC66C{
+		port: 	port,
+		Mode:	 MODE_UNKOWN,
+	}
 
-	if err := tc.WriteCommand([]byte(CmdQuery)); err == nil {
-		response := make([]byte, 4)
-		if err := tc.ReadFull(response); err == nil {
-			switch string(response) {
+	if err := tc.WriteCommand([]byte(CMD_QUERY)); err == nil {
+		var res = make([]byte, 4)
+		if err := tc.ReadFull(res); err == nil {
+			switch string(res) {
 			case "firm":
-				tc.Mode = ModeFirmware
+				tc.Mode = MODE_FIRMWARE
 			case "boot":
-				tc.Mode = ModeBootloader
+				tc.Mode = MODE_BOOTLOADER
+			default:
+				tc.Mode = MODE_UNKOWN
 			}
 		}
 	}
@@ -65,7 +85,7 @@ func NewTC66C(portName string) (*TC66C, error) {
 	return tc, nil
 }
 
-func (tc *TC66C) Close() error {
+func (tc *TC66C) TCClose() error {
 	return tc.port.Close()
 }
 
@@ -75,69 +95,56 @@ func (tc *TC66C) WriteCommand(cmd []byte) error {
 	return err
 }
 
-func (tc *TC66C) ReadFull(buf []byte) error {
+func (tc *TC66C) ReadFull(buff []byte) error {
 	total := 0
-	for total < len(buf) {
-		n, err := tc.port.Read(buf[total:])
+	for total < len(buff) {
+		n, err := tc.port.Read(buff[total:])
+
 		if err != nil {
 			return err
 		}
+
 		if n == 0 {
-			return fmt.Errorf("read timeout")
+			return fmt.Errorf("Read timeout")
 		}
 		total += n
 	}
 	return nil
 }
 
-func (tc *TC66C) GetReading() (*Reading, error) {
-	if tc.Mode != ModeFirmware {
+func (tc *TC66C) GetReading() (*powerReading, error) {
+	if tc.Mode != MODE_FIRMWARE {
 		return nil, fmt.Errorf("device not in firmware mode")
 	}
 
-	if err := tc.WriteCommand([]byte(CmdGetVA)); err != nil {
+	if err := tc.WriteCommand([]byte(CMD_GET_VA)); err != nil {
 		return nil, err
 	}
 
-	encrypted := make([]byte, PacketSize)
+	encrypted := make([]byte, PACKET_SIZE)
 	if err := tc.ReadFull(encrypted); err != nil {
 		return nil, err
 	}
 
-	decrypted := make([]byte, PacketSize)
-	if err := DecryptPacketInPlace(encrypted, decrypted); err != nil {
+	decrypted := make([]byte, PACKET_SIZE)
+	if err := DecryptPacket(encrypted, decrypted); err != nil {
 		return nil, err
 	}
 
-	reading := &Reading{}
+	reading := &powerReading{}
 	if err := ParseZeroAlloc(decrypted, reading); err != nil {
 		return nil, err
 	}
 	return reading, nil
 }
 
-type Reading struct {
-	Voltage     float64
-	Current     float64
-	Power       float64
-	Resistance  float64
-	CapacitymAh uint32
-	EnergymWh   uint32
-	DPlus       float64
-	DMinus      float64
-	Temperature float64
-}
-
-func CSVHeader() string {
-	return "timestamp,voltage_v,current_a,power_w,resistance_ohm,capacity_mah,energy_mwh,dplus_v,dminus_v,temperature_c"
-}
-
-func ParseZeroAlloc(data []byte, r *Reading) error {
+// Parses without allocation for optimized battery storage
+func ParseZeroAlloc(data []byte, r *powerReading) error {
 	pac1 := data[0:64]
 	pac2 := data[64:128]
 
-	if !VerifyChecksum(pac1[0:60], binary.LittleEndian.Uint16(pac1[60:62])) ||
-		!VerifyChecksum(pac2[0:60], binary.LittleEndian.Uint16(pac2[60:62])) {
+	if !VerifyCheckSum(pac1[0:60], binary.LittleEndian.Uint16(pac1[60:62])) ||
+		!VerifyCheckSum(pac2[0:60], binary.LittleEndian.Uint16(pac2[60:62])) {
 		return fmt.Errorf("checksum failed")
 	}
 

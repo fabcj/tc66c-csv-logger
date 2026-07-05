@@ -1,5 +1,4 @@
-package cpu
-
+package main
 import (
 	"bufio"
 	"encoding/binary"
@@ -13,6 +12,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func CPUHeader() string {
+	return ",cpu_temp_c,cpu_usage_pct,cpu_freq_mhz,cpu_total_cycles,cpu_target_cycles,attributed_watts\n"
+}
+
+// Static Adress for Raspberry Pi 4 Model B
 const (
 	thermalZonePath  = "/sys/class/thermal/thermal_zone0/temp"
 	cpuFreqPath      = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
@@ -20,7 +24,7 @@ const (
 	cgroupV2BasePath = "/sys/fs/cgroup"
 )
 
-type Reading struct {
+type cpuReading struct {
 	TemperatureC float64
 	UsagePercent float64
 	FreqMHz      float64
@@ -106,6 +110,10 @@ func readCgroupUsec(path string) (uint64, error) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	if err := scanner.Err(); err != nil {
+    	fmt.Printf("usage_usec not found in %s", err)
+	}
+
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) == 2 && fields[0] == "usage_usec" {
@@ -127,7 +135,7 @@ func readCPUFreqHz() (float64, error) {
 	return khz * 1000.0, nil
 }
 
-func NewMonitor(targetPID int, serviceName string) *Monitor {
+func NewCPUMonitor(targetPID int, serviceName string) *Monitor {
 	m := &Monitor{
 		targetPID: targetPID,
 		targetFd:  -1,
@@ -192,7 +200,7 @@ func readFdCounter(fd int) (uint64, error) {
 	return binary.LittleEndian.Uint64(buf[:]), nil
 }
 
-func (m *Monitor) Sample() (*Reading, error) {
+func (m *Monitor) Sample() (*cpuReading, error) {
 	temp, _ := readTemperature()
 	freq, _ := readFrequency()
 	usage, _ := m.readUsage()
@@ -234,7 +242,7 @@ func (m *Monitor) Sample() (*Reading, error) {
 	m.prevSysCyc = totalSysCycles
 	m.prevTgtCyc = targetCycles
 
-	return &Reading{
+	return &cpuReading{
 		TemperatureC: temp,
 		UsagePercent: usage,
 		FreqMHz:      freq,
@@ -332,7 +340,7 @@ func (m *Monitor) readUsage() (float64, error) {
 	return usage, nil
 }
 
-func (m *Monitor) Close() {
+func (m *Monitor) CPUClose() {
 	if m.targetFd > 0 {
 		unix.Close(m.targetFd)
 	}

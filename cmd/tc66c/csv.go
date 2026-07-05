@@ -4,48 +4,52 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/signal"
 	"strconv"
-	"syscall"
 	"time"
-
-	"github.com/skgsergio/tc66-toolkit/internal/cpu"
-	"github.com/skgsergio/tc66-toolkit/internal/protocol"
 )
 
-func startCSVLogging(port string, filename string, interval time.Duration, targetPID int, serviceName string) {
-	fmt.Printf("[PORT Monitor]: Connecting to monitor\n")
-	tc, err := protocol.NewTC66C(port)
+type CSVWriter struct {
+	file *os.File
+	writer *bufio.Writer
+	scratch []byte
+}
+
+func CSVHeader() string {
+	return "timestamp,voltage_v,current_a,power_w,resistance_ohm,capacity_mah,energy_mwh,dplus_v,dminus_v,temperature_c"
+}
+
+func startCSVLogging(port string, fileName string, interval time.Duration , serviceName string, pid int) {
+	// Connect to port
+	tc, err := NewTC66C(port)
 	if err != nil {
-		fmt.Printf("Connection failed: %v\n", err)
+		fmt.Printf("[ERR]Connection failed: %v\n", err)
 		os.Exit(1)
 	}
-	defer tc.Close()
 
-	cpuMon := cpu.NewMonitor(targetPID, serviceName)
+	// Enable CPU Monitor
+	cpuMon := NewCPUMonitor(pid, serviceName)
 	cpuEnabled := true
 	if err := cpuMon.Prime(); err != nil {
-		fmt.Printf("[CPU Monitor] PMU initialization skipped: %v\n", err)
+		fmt.Printf("[LOG] PMU initialization skipped: %v\n", err)
 		cpuEnabled = false
 	}
-	defer cpuMon.Close()
+	defer cpuMon.CPUClose()
 
-	cw, err := NewCSVWriter(filename)
+	// Create CSV Writer
+	cw, err := NewCSVWriter(fileName)
 	if err != nil {
-		fmt.Printf("Failed to create CSV: %v\n", err)
+		fmt.Printf("[ERR] Failed to create CSV: %v\n", err)
 		os.Exit(1)
 	}
-	defer cw.Close()
+	defer cw.CSVClose()
 
-	fmt.Printf("\n▶ RECORDING STARTED\n")
-	fmt.Printf("Saving data to '%s' every %v.\n", filename, interval)
+	fmt.Printf("\n -- Power Meter Recording Started --\n")
+	fmt.Printf("Saving data to '%s' every %v.\n", fileName, interval)
+
 	if cpuEnabled {
-		fmt.Printf("CPU telemetry (temp/usage/freq) is being logged alongside each sample.\n")
+		fmt.Printf("CPU (temp/usage/freq) is being logged alongside each sample.\n")
 	}
 	fmt.Printf("Press Ctrl+C to safely stop and save the file.\n\n")
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -55,27 +59,29 @@ func startCSVLogging(port string, filename string, interval time.Duration, targe
 	for {
 		select {
 		case <-sigChan:
-			fmt.Printf("\n[Signal] Intercepted shutdown. Flushed %d samples to disk safely. Goodbye!\n", sampleCount)
+			fmt.Printf("\n[LOG: Signal] Intercepted shutdown. Flushed %d samples to disk safely. Goodbye!\n", sampleCount)
+			tc.TCClose()
+			
 			return
 
 		case <-ticker.C:
 			reading, err := tc.GetReading()
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "[Device Error] Failed reading packet: %v\n", err)
+				fmt.Fprintf(os.Stderr, "[ERR: Device] Failed reading packet: %v\n", err)
 				continue
 			}
 
-			var cpuReading *cpu.Reading
+			var cpuReading *cpuReading
 			if cpuEnabled {
 				cpuReading, err = cpuMon.Sample()
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "[CPU Monitor] Failed reading stats: %v\n", err)
+					fmt.Fprintf(os.Stderr, "[LOG: CPU Monitor] Failed reading stats: %v\n", err)
 					cpuReading = nil
 				}
 			}
 
 			if err := cw.WriteLog(reading, cpuReading); err != nil {
-				fmt.Fprintf(os.Stderr, "[Write Error] Failed writing to file: %v\n", err)
+				fmt.Fprintf(os.Stderr, "[ERR: Write Error] Failed writing to file: %v\n", err)
 				return
 			}
 
@@ -87,34 +93,41 @@ func startCSVLogging(port string, filename string, interval time.Duration, targe
 	}
 }
 
-type CSVWriter struct {
-	file    *os.File
-	writer  *bufio.Writer
-	scratch []byte
-}
 
-func NewCSVWriter(filename string) (*CSVWriter, error) {
-	file, err := os.Create(filename)
+// https://reintech.io/blog/reading-writing-files-go
+// https://pkg.go.dev/encoding/csv
+func NewCSVWriter (fileName string) (*CSVWriter, error)  {
+	outFile, err := os.Create(fileName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create CSV file: %w", err)
+		fmt.Fprintf(os.Stderr, "[ERR]Error creating file: %v\n", err)
+		os.Exit(1)
 	}
 
-	writer := bufio.NewWriterSize(file, 64*1024)
-
-	header := protocol.CSVHeader() + ",cpu_temp_c,cpu_usage_pct,cpu_freq_mhz,cpu_total_cycles,cpu_target_cycles,attributed_watts\n"
+	// Used buffered Writer
+	writer := bufio.NewWriter(outFile)
+	
+	//Iniitalize Header
+	header := CSVHeader() + CPUHeader()
 	if _, err := writer.WriteString(header); err != nil {
-		file.Close()
+		outFile.Close()
 		return nil, err
 	}
 
+	// Check ERror
+	if err := writer.Flush(); err != nil {
+        fmt.Fprintf(os.Stderr, "error flushing buffer: %v\n", err)
+        os.Exit(1)
+    }
+
+	// Rturn reference to type
 	return &CSVWriter{
-		file:    file,
+		file:    outFile,
 		writer:  writer,
 		scratch: make([]byte, 0, 160),
 	}, nil
 }
 
-func (cw *CSVWriter) WriteLog(r *protocol.Reading, cpuR *cpu.Reading) error {
+func (cw *CSVWriter) WriteLog(r *powerReading, cpuR *cpuReading) error {
 	now := time.Now()
 	cw.scratch = cw.scratch[:0]
 
@@ -140,12 +153,6 @@ func (cw *CSVWriter) WriteLog(r *protocol.Reading, cpuR *cpu.Reading) error {
 	cw.scratch = append(cw.scratch, ',')
 
 	if cpuR != nil {
-		const pi4IdleBaseline = 2.50
-		attributedWatts := 0.0
-		if r.Power > pi4IdleBaseline && cpuR.TotalCycles > 0 {
-			attributedWatts = (r.Power - pi4IdleBaseline) * (float64(cpuR.TargetCycles) / float64(cpuR.TotalCycles))
-		}
-
 		cw.scratch = strconv.AppendFloat(cw.scratch, cpuR.TemperatureC, 'f', 1, 64)
 		cw.scratch = append(cw.scratch, ',')
 		cw.scratch = strconv.AppendFloat(cw.scratch, cpuR.UsagePercent, 'f', 1, 64)
@@ -156,7 +163,7 @@ func (cw *CSVWriter) WriteLog(r *protocol.Reading, cpuR *cpu.Reading) error {
 		cw.scratch = append(cw.scratch, ',')
 		cw.scratch = strconv.AppendUint(cw.scratch, cpuR.TargetCycles, 10)
 		cw.scratch = append(cw.scratch, ',')
-		cw.scratch = strconv.AppendFloat(cw.scratch, attributedWatts, 'f', 4, 64)
+
 	} else {
 		cw.scratch = append(cw.scratch, ",,,,,0"...)
 	}
@@ -166,10 +173,11 @@ func (cw *CSVWriter) WriteLog(r *protocol.Reading, cpuR *cpu.Reading) error {
 	return err
 }
 
-func (cw *CSVWriter) Close() error {
+func (cw *CSVWriter) CSVClose() error {
 	if err := cw.writer.Flush(); err != nil {
 		cw.file.Close()
 		return fmt.Errorf("failed to flush CSV buffer: %w", err)
-	}
+    }
 	return cw.file.Close()
 }
+

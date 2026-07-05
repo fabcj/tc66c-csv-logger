@@ -1,11 +1,10 @@
-package protocol
+package main
 
 import (
 	"crypto/aes"
 	"crypto/cipher"
 	"fmt"
 )
-
 
 var AESKey = []byte{
 	0x58, 0x21, 0xfa, 0x56, 0x01, 0xb2, 0xf0, 0x26,
@@ -16,14 +15,14 @@ var AESKey = []byte{
 
 var (
 	cipherBlock cipher.Block
-	crc16Table  [256]uint16 
+	crc16Table  [256]uint16
 )
 
 func init() {
 	var err error
 	cipherBlock, err = aes.NewCipher(AESKey)
 	if err != nil {
-		panic(fmt.Sprintf("failed to initialize AES cipher: %v", err))
+		panic(fmt.Sprintf("[ERR] Failed to initialize AES cipher: %v", err))
 	}
 
 	for i := 0; i < 256; i++ {
@@ -39,22 +38,22 @@ func init() {
 	}
 }
 
-func DecryptPacketInPlace(encrypted, decrypted []byte) error {
-	if len(encrypted) != PacketSize || len(decrypted) != PacketSize {
-		return fmt.Errorf("invalid packet size: got %d, want %d", len(encrypted), PacketSize)
+func DecryptPacket(encrypted, decrypted []byte) error {
+	if len(encrypted) < PACKET_SIZE || len(decrypted) < PACKET_SIZE {
+		return fmt.Errorf("invalid packet size: got %d, want %d", len(encrypted), PACKET_SIZE)
 	}
 
 	blockSize := cipherBlock.BlockSize()
-	for i := 0; i < PacketSize; i += blockSize {
+	for i := 0; i < PACKET_SIZE; i += blockSize {
 		cipherBlock.Decrypt(decrypted[i:i+blockSize], encrypted[i:i+blockSize])
 	}
 	return nil
 }
 
-func VerifyChecksum(data []byte, expectedCRC uint16) bool {
+func VerifyCheckSum(data []byte, excpectedCRC uint16) bool {
 	crc := uint16(0xFFFF)
 	for _, b := range data {
 		crc = (crc >> 8) ^ crc16Table[byte(crc)^b]
 	}
-	return crc == expectedCRC
+	return crc == excpectedCRC
 }

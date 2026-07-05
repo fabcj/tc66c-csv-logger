@@ -1,10 +1,8 @@
-module github.com/skgsergio/tc66-toolkit
+module cmd/tc66c
 
-go 1.25
+go 1.26.4
 
 require (
-	go.bug.st/serial v1.6.4
-	golang.org/x/sys v0.19.0
+	go.bug.st/serial v1.7.1
+	golang.org/x/sys v0.46.0
 )
-
-require github.com/creack/goselect v0.1.2 // indirect

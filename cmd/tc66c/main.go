@@ -1,58 +1,98 @@
 package main
 
 import (
-	"bufio"
-	"flag"
-	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
+    "flag"
+    "fmt"
+    "io/fs"
+    "log"
+    "os"
+    "sync"
+    "time"
+    "net/http"
 )
 
-func autoDetectPort() (string, error) {
-	patterns := []string{"/dev/ttyACM*", "/dev/ttyUSB*"}
+var (
+    sigChan = make(chan bool, 1)
+    csvLock sync.Mutex
+)
 
-	for _, pattern := range patterns {
-		matches, err := filepath.Glob(pattern)
-		if err == nil && len(matches) > 0 {
-			return matches[0], nil
-		}
-	}
+// https://dev.to/rezmoss/pattern-matching-with-glob-finding-files-by-pattern-59-23lc
+func GetUsbPort() (string, error) {
+    var fsys = os.DirFS("/dev")
+    var commonPorts = []string{"ttyUSB*", "ttyACM*"}
 
-	return "", fmt.Errorf("TC66C not found. Is it plugged in?")
+    for _, ports := range commonPorts {
+        matches, err := fs.Glob(fsys, ports)
+        if err != nil {
+            continue
+        }
+
+        if len(matches) > 0 {
+            var fullPath = "/dev/" + matches[0]
+            return fullPath, nil
+        }
+    }
+
+    return "", fmt.Errorf("TC66C USB Meter could not be found, is it plugged in?\n")
 }
 
+// https://stackoverflow.com/questions/49704456/how-to-read-from-device-when-stdin-is-pipe
 func main() {
-	portFlag        := flag.String("port", "", "Serial port device path")
-	intervalFlag    := flag.Duration("interval", 250*time.Millisecond, "Sampling polling interval")
-	targetPIDFlag   := flag.Int("pid", -1, "Target Process ID (PID) to attribute power consumption to")
-	serviceFlag     := flag.String("service", "", "Systemd service name to attribute power consumption to (e.g. apache2)")
-	flag.Parse()
+    defaultFileName := fmt.Sprintf("tc66c_data_%s.csv", time.Now().Format("20060102_150405"))
 
-	if *targetPIDFlag > 0 && *serviceFlag != "" {
-		fmt.Println("Error: -pid and -service are mutually exclusive.")
-		os.Exit(1)
-	}
+    flagFileName := flag.String("F", defaultFileName, "Name of the input file")
+    flagInterval := flag.Duration("I", 500*time.Millisecond, "Sampling poll Interval")
+    flagService := flag.String("S", "apache2", "Systemd Service name")
+    flagPort := flag.String("P", "", "Serial port device path")
+    flagtargetPID := flag.Int("D", -1, "Target Process ID (PID)")
+    
+    flag.Parse()
 
-	port := *portFlag
-	if port == "" {
-		var err error
-		port, err = autoDetectPort()
-		if err != nil {
-			fmt.Printf("Hardware Error: %v\n", err)
-			os.Exit(1)
-		}
-	}
-	fmt.Printf("✓ Found TC66C on %s\n", port)
+    port := *flagPort
+    if port == "" {
+        var err error
+        port, err = GetUsbPort()
+        if err != nil {
+            fmt.Printf("[Hardware] Port error: %v \n", err)
+            os.Exit(1)
+        }
+    }
 
-	fmt.Print("Enter output CSV file name (Press Enter for default: 'tc66c_output.csv'): ")
-	reader := bufio.NewReader(os.Stdin)
-	filename, _ := reader.ReadString('\n')
-	filename = strings.TrimSpace(filename)
-	if filename == "" {
-		filename = "tc66c_output.csv"
-	}
+    fmt.Printf("Found TC66C on port: %s\n", port)
 
-	startCSVLogging(port, filename, *intervalFlag, *targetPIDFlag, *serviceFlag)
+    // https://pkg.go.dev/bufio#Reader
+    tc66cPort, err := os.Open(port)
+    if err != nil {
+        log.Fatalf("can't open /dev/tty: %s", err)
+    }
+
+    // Verify we have access to the port
+    _ = tc66cPort
+    tc66cPort.Close()
+
+    // https://ralimtek.com/posts/2019/tc66/
+    // https://gobyexample.com/http-servers
+    http.HandleFunc("/stop", func(w http.ResponseWriter, req *http.Request) {
+        sigChan <- true
+        w.Write([]byte("Stopped TC66C Monitor\n"))
+    })
+
+	http.HandleFunc("/start", func(w http.ResponseWriter, req *http.Request) {
+        csvLock.Lock()
+        defer csvLock.Unlock() 
+        
+        fileName := req.URL.Query().Get("file")
+        if fileName == "" {
+            fileName = *flagFileName
+        }
+
+        sigChan <- true
+        go startCSVLogging(port, fileName, *flagInterval, *flagService, *flagtargetPID)
+        
+        responseMsg := fmt.Sprintf("Started TC66C Monitor logging to %s\n", fileName)
+        w.Write([]byte(responseMsg))
+    })
+
+    fmt.Println("Server listening on :9000... Navigate to http://localhost:9000/start")
+    log.Fatal(http.ListenAndServe(":9000", nil))
 }
