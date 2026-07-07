@@ -1,4 +1,7 @@
+//go:build linux
+
 package main
+
 import (
 	"bufio"
 	"encoding/binary"
