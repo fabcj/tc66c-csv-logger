@@ -3,9 +3,13 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"fmt"
+	"errors"
 )
 
+// ErrInvalidPacketSize is returned when decryption buffers are smaller than the required packet size.
+var ErrInvalidPacketSize = errors.New("invalid packet size")
+
+// AESKey is the hardcoded decryption key for the TC66C protocol.
 var AESKey = []byte{
 	0x58, 0x21, 0xfa, 0x56, 0x01, 0xb2, 0xf0, 0x26,
 	0x87, 0xff, 0x12, 0x04, 0x62, 0x2a, 0x4f, 0xb0,
@@ -20,11 +24,14 @@ var (
 
 func init() {
 	var err error
+
 	cipherBlock, err = aes.NewCipher(AESKey)
 	if err != nil {
-		panic(fmt.Sprintf("[ERR] Failed to initialize AES cipher: %v", err))
+		// Replaced panic with the fatalErr helper function from main.go
+		fatalErr("[ERR] Failed to initialize AES cipher", err)
 	}
 
+	// Precompute the CRC16 table for fast checksum verification
 	for i := 0; i < 256; i++ {
 		crc := uint16(i)
 		for j := 0; j < 8; j++ {
@@ -38,22 +45,27 @@ func init() {
 	}
 }
 
+// DecryptPacket decrypts the raw USB packet into a pre-allocated destination buffer.
+// Both buffers must be at least PACKET_SIZE in length to prevent out-of-bounds panics.
 func DecryptPacket(encrypted, decrypted []byte) error {
 	if len(encrypted) < PACKET_SIZE || len(decrypted) < PACKET_SIZE {
-		return fmt.Errorf("invalid packet size: got %d, want %d", len(encrypted), PACKET_SIZE)
+		return ErrInvalidPacketSize
 	}
 
 	blockSize := cipherBlock.BlockSize()
 	for i := 0; i < PACKET_SIZE; i += blockSize {
 		cipherBlock.Decrypt(decrypted[i:i+blockSize], encrypted[i:i+blockSize])
 	}
+
 	return nil
 }
 
-func VerifyCheckSum(data []byte, excpectedCRC uint16) bool {
+// VerifyCheckSum validates the data integrity against the provided CRC16 checksum.
+func VerifyCheckSum(data []byte, expectedCRC uint16) bool {
 	crc := uint16(0xFFFF)
 	for _, b := range data {
 		crc = (crc >> 8) ^ crc16Table[byte(crc)^b]
 	}
-	return crc == excpectedCRC
+
+	return crc == expectedCRC
 }

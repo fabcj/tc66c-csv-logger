@@ -3,23 +3,25 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
+	"syscall"
 	"unsafe"
-
-	"golang.org/x/sys/unix"
 )
 
-func CPUHeader() string {
-	return ",cpu_temp_c,cpu_usage_pct,cpu_freq_mhz,cpu_total_cycles,cpu_target_cycles,attributed_watts\n"
-}
+// Define package-level static errors to avoid heap allocations during parsing and reading.
+var (
+	ErrNoIntDigits  = errors.New("no integer digits found")
+	ErrThermalFile  = errors.New("thermal file unavailable")
+	ErrCPUFreqFile  = errors.New("cpufreq file unavailable")
+	ErrCgroupFile   = errors.New("cgroup file unavailable")
+	ErrUsageUsec    = errors.New("usage_usec not found")
+	ErrProcStatFile = errors.New("procStat file unavailable")
+)
 
-// Static Adress for Raspberry Pi 4 Model B
 const (
 	thermalZonePath  = "/sys/class/thermal/thermal_zone0/temp"
 	cpuFreqPath      = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
@@ -27,6 +29,14 @@ const (
 	cgroupV2BasePath = "/sys/fs/cgroup"
 )
 
+const (
+	perfTypeHardware          = 0
+	perfCountHWCPUCycles      = 0
+	perfFlagExcludeKernel     = 1 << 2
+	perfFlagExcludeHypervisor = 1 << 4
+)
+
+// cpuReading holds the parsed hardware telemetry.
 type cpuReading struct {
 	TemperatureC float64
 	UsagePercent float64
@@ -35,20 +45,32 @@ type cpuReading struct {
 	TargetCycles uint64
 }
 
+// Monitor manages file descriptors and state for zero-allocation CPU tracking.
 type Monitor struct {
-	prevIdle      uint64
-	prevTotal     uint64
-	primed        bool
-	targetPID     int
-	targetFd      int
-	systemFds     []int
-	prevSysCyc    uint64
-	prevTgtCyc    uint64
-	cgroupStatPath string
-	prevCgroupUsec uint64
+	prevIdle            uint64
+	prevTotal           uint64
+	primed              bool
+	targetPID           int
+	targetFd            int
+	systemFds           []int
+	prevSysCyc          uint64
+	prevTgtCyc          uint64
+	cgroupStatPath      string
+	prevCgroupUsec      uint64
 	cgroupTicksPerCycle float64
+
+	// Open File Handles held open for persistent zero-alloc reads
+	thermalFile  *os.File
+	cpuFreqFile  *os.File
+	procStatFile *os.File
+	cgroupFile   *os.File
+
+	// Reusable byte buffer for sysfs/procfs reads (zero heap allocations)
+	readBuf [1024]byte
+	reading cpuReading
 }
 
+// perfEventAttr maps to the Linux kernel perf_event_attr struct.
 type perfEventAttr struct {
 	Type         uint32
 	Size         uint32
@@ -63,13 +85,12 @@ type perfEventAttr struct {
 	BpLen        uint64
 }
 
-const (
-	perfTypeHardware          = 0
-	perfCountHWCPUCycles      = 0
-	perfFlagExcludeKernel     = 1 << 2
-	perfFlagExcludeHypervisor = 1 << 4
-)
+// CPUHeader returns the standard column names for the CPU data.
+func CPUHeader() string {
+	return ",cpu_temp_c,cpu_usage_pct,cpu_freq_mhz,cpu_total_cycles,cpu_target_cycles\n"
+}
 
+// openCycleCounter uses raw syscalls to open hardware perf event counters.
 func openCycleCounter(pid, cpu int) (int, error) {
 	attr := perfEventAttr{
 		Type:   perfTypeHardware,
@@ -77,8 +98,8 @@ func openCycleCounter(pid, cpu int) (int, error) {
 		Config: perfCountHWCPUCycles,
 		Bits:   perfFlagExcludeKernel | perfFlagExcludeHypervisor,
 	}
-	fd, _, errno := unix.Syscall6(
-		unix.SYS_PERF_EVENT_OPEN,
+	fd, _, errno := syscall.Syscall6(
+		syscall.SYS_PERF_EVENT_OPEN,
 		uintptr(unsafe.Pointer(&attr)),
 		uintptr(pid),
 		uintptr(cpu),
@@ -92,6 +113,7 @@ func openCycleCounter(pid, cpu int) (int, error) {
 	return int(fd), nil
 }
 
+// resolveCgroupPath dynamically locates the systemd cgroup path for the target service.
 func resolveCgroupPath(serviceName string) (string, error) {
 	candidates := []string{
 		filepath.Join(cgroupV2BasePath, "system.slice", serviceName+".service", "cpu.stat"),
@@ -102,47 +124,21 @@ func resolveCgroupPath(serviceName string) (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("cgroup cpu.stat not found for service %q; is it running under systemd with cgroup v2?", serviceName)
+	// This error is only generated once at startup, so standard string concatenation is fine.
+	return "", errors.New("cgroup cpu.stat not found for service: " + serviceName)
 }
 
-func readCgroupUsec(path string) (uint64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	if err := scanner.Err(); err != nil {
-    	fmt.Printf("usage_usec not found in %s", err)
-	}
-
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) == 2 && fields[0] == "usage_usec" {
-			return strconv.ParseUint(fields[1], 10, 64)
-		}
-	}
-	return 0, fmt.Errorf("usage_usec not found in %s", path)
-}
-
-func readCPUFreqHz() (float64, error) {
-	data, err := os.ReadFile(cpuFreqPath)
-	if err != nil {
-		return 0, err
-	}
-	khz, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64)
-	if err != nil {
-		return 0, err
-	}
-	return khz * 1000.0, nil
-}
-
+// NewCPUMonitor constructs and initializes a new hardware monitor.
 func NewCPUMonitor(targetPID int, serviceName string) *Monitor {
 	m := &Monitor{
 		targetPID: targetPID,
 		targetFd:  -1,
 	}
+
+	// Open sysfs / procfs files ONCE during initialization
+	m.thermalFile, _ = os.Open(thermalZonePath)
+	m.cpuFreqFile, _ = os.Open(cpuFreqPath)
+	m.procStatFile, _ = os.Open(procStatPath)
 
 	numCPU := 0
 	for {
@@ -159,8 +155,8 @@ func NewCPUMonitor(targetPID int, serviceName string) *Monitor {
 		path, err := resolveCgroupPath(serviceName)
 		if err == nil {
 			m.cgroupStatPath = path
+			m.cgroupFile, _ = os.Open(path)
 		}
-
 	case targetPID > 0:
 		fd, err := openCycleCounter(targetPID, -1)
 		if err == nil {
@@ -171,8 +167,9 @@ func NewCPUMonitor(targetPID int, serviceName string) *Monitor {
 	return m
 }
 
+// Prime reads initial values to establish the baseline for delta calculations.
 func (m *Monitor) Prime() error {
-	idle, total, err := readStat()
+	idle, total, err := m.readStat()
 	if err != nil {
 		return err
 	}
@@ -180,12 +177,12 @@ func (m *Monitor) Prime() error {
 	m.prevTotal = total
 	m.primed = true
 
-	if m.cgroupStatPath != "" {
-		usec, err := readCgroupUsec(m.cgroupStatPath)
+	if m.cgroupFile != nil {
+		usec, err := m.readCgroupUsec()
 		if err == nil {
 			m.prevCgroupUsec = usec
 		}
-		freqHz, err := readCPUFreqHz()
+		freqHz, err := m.readCPUFreqHz()
 		if err == nil && freqHz > 0 {
 			m.cgroupTicksPerCycle = 1e6 / freqHz
 		}
@@ -194,18 +191,144 @@ func (m *Monitor) Prime() error {
 	return nil
 }
 
+// parseUintBytes is a fast inline byte-slice parser avoiding string allocations.
+func parseUintBytes(b []byte) (uint64, error) {
+	var n uint64
+	var found bool
+	for _, c := range b {
+		if c >= '0' && c <= '9' {
+			n = n*10 + uint64(c-'0')
+			found = true
+		} else if found {
+			break
+		}
+	}
+	if !found {
+		return 0, ErrNoIntDigits
+	}
+	return n, nil
+}
+
+// readTemperature reads and parses the hardware thermal zone sensor.
+func (m *Monitor) readTemperature() (float64, error) {
+	if m.thermalFile == nil {
+		return 0, ErrThermalFile
+	}
+	n, err := m.thermalFile.ReadAt(m.readBuf[:], 0)
+	if err != nil && n == 0 {
+		return 0, err
+	}
+	milliC, err := parseUintBytes(m.readBuf[:n])
+	if err != nil {
+		return 0, err
+	}
+	return float64(milliC) / 1000.0, nil
+}
+
+// readFrequency reads the current CPU scaling frequency.
+func (m *Monitor) readFrequency() (float64, error) {
+	if m.cpuFreqFile == nil {
+		return 0, ErrCPUFreqFile
+	}
+	n, err := m.cpuFreqFile.ReadAt(m.readBuf[:], 0)
+	if err != nil && n == 0 {
+		return 0, err
+	}
+	khz, err := parseUintBytes(m.readBuf[:n])
+	if err != nil {
+		return 0, err
+	}
+	return float64(khz) / 1000.0, nil
+}
+
+// readCPUFreqHz converts the hardware frequency into raw Hertz.
+func (m *Monitor) readCPUFreqHz() (float64, error) {
+	mhz, err := m.readFrequency()
+	if err != nil {
+		return 0, err
+	}
+	return mhz * 1e6, nil
+}
+
+// readCgroupUsec reads the raw microsecond CPU usage for the designated cgroup.
+func (m *Monitor) readCgroupUsec() (uint64, error) {
+	if m.cgroupFile == nil {
+		return 0, ErrCgroupFile
+	}
+	n, err := m.cgroupFile.ReadAt(m.readBuf[:], 0)
+	if err != nil && n == 0 {
+		return 0, err
+	}
+	data := m.readBuf[:n]
+	key := []byte("usage_usec")
+	idx := bytes.Index(data, key)
+	if idx == -1 {
+		return 0, ErrUsageUsec
+	}
+	return parseUintBytes(data[idx+len(key):])
+}
+
+// readStat processes /proc/stat to determine overall system CPU idle and total times.
+func (m *Monitor) readStat() (idle uint64, total uint64, err error) {
+	if m.procStatFile == nil {
+		return 0, 0, ErrProcStatFile
+	}
+	n, err := m.procStatFile.ReadAt(m.readBuf[:], 0)
+	if err != nil && n == 0 {
+		return 0, 0, err
+	}
+	data := m.readBuf[:n]
+	idx := bytes.IndexByte(data, '\n')
+	if idx == -1 {
+		idx = len(data)
+	}
+	line := data[:idx]
+
+	i := 0
+	for i < len(line) && (line[i] == 'c' || line[i] == 'p' || line[i] == 'u' || line[i] == ' ') {
+		i++
+	}
+
+	fieldIdx := 0
+	for i < len(line) {
+		for i < len(line) && line[i] == ' ' {
+			i++
+		}
+		if i >= len(line) {
+			break
+		}
+		var val uint64
+		var found bool
+		for i < len(line) && line[i] >= '0' && line[i] <= '9' {
+			val = val*10 + uint64(line[i]-'0')
+			i++
+			found = true
+		}
+		if found {
+			total += val
+			if fieldIdx == 3 || fieldIdx == 4 { // idle or iowait
+				idle += val
+			}
+			fieldIdx++
+		}
+	}
+	return idle, total, nil
+}
+
+// readFdCounter reads the binary value directly out of a kernel perf event file descriptor.
 func readFdCounter(fd int) (uint64, error) {
 	var buf [8]byte
-	n, err := unix.Read(fd, buf[:])
+	n, err := syscall.Read(fd, buf[:])
 	if err != nil || n != 8 {
 		return 0, err
 	}
 	return binary.LittleEndian.Uint64(buf[:]), nil
 }
 
+// Sample collects a complete set of CPU telemetry metrics.
 func (m *Monitor) Sample() (*cpuReading, error) {
-	temp, _ := readTemperature()
-	freq, _ := readFrequency()
+	temp, _ := m.readTemperature()
+	freq, _ := m.readFrequency()
 	usage, _ := m.readUsage()
 
 	var totalSysCycles uint64
@@ -217,21 +340,19 @@ func (m *Monitor) Sample() (*cpuReading, error) {
 	}
 
 	var targetCycles uint64
-
 	switch {
-	case m.cgroupStatPath != "":
-		usec, err := readCgroupUsec(m.cgroupStatPath)
+	case m.cgroupFile != nil:
+		usec, err := m.readCgroupUsec()
 		if err == nil {
 			deltaUsec := usec - m.prevCgroupUsec
 			m.prevCgroupUsec = usec
-			freqHz, err := readCPUFreqHz()
+			freqHz, err := m.readCPUFreqHz()
 			if err == nil && freqHz > 0 {
 				targetCycles = uint64(float64(deltaUsec) * freqHz / 1e6)
 			} else if m.cgroupTicksPerCycle > 0 {
 				targetCycles = uint64(float64(deltaUsec) / m.cgroupTicksPerCycle)
 			}
 		}
-
 	case m.targetFd > 0:
 		val, err := readFdCounter(m.targetFd)
 		if err == nil {
@@ -245,72 +366,19 @@ func (m *Monitor) Sample() (*cpuReading, error) {
 	m.prevSysCyc = totalSysCycles
 	m.prevTgtCyc = targetCycles
 
-	return &cpuReading{
+	m.reading = cpuReading{
 		TemperatureC: temp,
 		UsagePercent: usage,
 		FreqMHz:      freq,
 		TotalCycles:  deltaSys,
 		TargetCycles: deltaTgt,
-	}, nil
+	}
+	return &m.reading, nil
 }
 
-func readTemperature() (float64, error) {
-	data, err := os.ReadFile(thermalZonePath)
-	if err != nil {
-		return 0, err
-	}
-	milliC, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64)
-	if err != nil {
-		return 0, fmt.Errorf("unexpected value in %s: %w", thermalZonePath, err)
-	}
-	return milliC / 1000.0, nil
-}
-
-func readFrequency() (float64, error) {
-	data, err := os.ReadFile(cpuFreqPath)
-	if err != nil {
-		return 0, err
-	}
-	khz, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64)
-	if err != nil {
-		return 0, fmt.Errorf("unexpected value in %s: %w", cpuFreqPath, err)
-	}
-	return khz / 1000.0, nil
-}
-
-func readStat() (idle uint64, total uint64, err error) {
-	f, err := os.Open(procStatPath)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	if !scanner.Scan() {
-		return 0, 0, fmt.Errorf("empty %s", procStatPath)
-	}
-
-	fields := strings.Fields(scanner.Text())
-	if len(fields) < 5 || fields[0] != "cpu" {
-		return 0, 0, fmt.Errorf("unexpected format in %s", procStatPath)
-	}
-
-	for i, raw := range fields[1:] {
-		v, err := strconv.ParseUint(raw, 10, 64)
-		if err != nil {
-			return 0, 0, fmt.Errorf("unexpected value in %s: %w", procStatPath, err)
-		}
-		total += v
-		if i == 3 || i == 4 {
-			idle += v
-		}
-	}
-
-	return idle, total, nil
-}
-
+// readUsage calculates CPU load percent based on total vs idle deltas.
 func (m *Monitor) readUsage() (float64, error) {
-	idle, total, err := readStat()
+	idle, total, err := m.readStat()
 	if err != nil {
 		return 0, err
 	}
@@ -333,7 +401,6 @@ func (m *Monitor) readUsage() (float64, error) {
 	}
 
 	usage := (1.0 - float64(deltaIdle)/float64(deltaTotal)) * 100.0
-
 	if usage < 0 {
 		usage = 0
 	} else if usage > 100 {
@@ -343,11 +410,24 @@ func (m *Monitor) readUsage() (float64, error) {
 	return usage, nil
 }
 
+// CPUClose safely disposes of all open file descriptors.
 func (m *Monitor) CPUClose() {
+	if m.thermalFile != nil {
+		m.thermalFile.Close()
+	}
+	if m.cpuFreqFile != nil {
+		m.cpuFreqFile.Close()
+	}
+	if m.procStatFile != nil {
+		m.procStatFile.Close()
+	}
+	if m.cgroupFile != nil {
+		m.cgroupFile.Close()
+	}
 	if m.targetFd > 0 {
-		unix.Close(m.targetFd)
+		syscall.Close(m.targetFd)
 	}
 	for _, fd := range m.systemFds {
-		unix.Close(fd)
+		syscall.Close(fd)
 	}
 }
